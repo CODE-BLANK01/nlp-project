@@ -1,0 +1,48 @@
+{
+  "name": "workday-jarvis",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "verify": "node src/scripts/verifypgsetup.js",
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "dev": "nodemon src/index.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@google/genai": "^1.15.0",
+    "@google/generative-ai": "^0.24.1",
+    "@slack/bolt": "^4.4.0",
+    "connect-flash": "^0.1.1",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.1",
+    "ejs": "^3.1.10",
+    "express": "^5.1.0",
+    "express-ejs-layouts": "^2.5.1",
+    "express-session": "^1.18.2",
+    "gpt-3-encoder": "^1.1.4",
+    "jsonwebtoken": "^9.0.2",
+    "mammoth": "^1.11.0",
+    "multer": "^2.0.2",
+    "node-fetch": "^3.3.2",
+    "nodemailer": "^7.0.6",
+    "openai": "^5.16.0",
+    "p-limit": "^7.1.1",
+    "pdfjs-dist": "^5.4.54",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "@prisma/client": "^6.14.0",
+    "@types/cookie-parser": "^1.4.9",
+    "@types/express": "^5.0.3",
+    "@types/jsonwebtoken": "^9.0.10",
+    "nodemon": "^3.1.10",
+    "prisma": "^6.14.0",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.9.2"
+  }
+}

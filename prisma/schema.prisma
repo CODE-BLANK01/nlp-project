@@ -1,0 +1,125 @@
+// prisma/schema.prisma
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  EMPLOYEE
+  MANAGER
+  HR
+  ADMIN
+}
+
+model Tenant {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  domain    String?  @unique
+  createdAt DateTime @default(now())
+
+  Users     User[]
+  Docs      Document[]
+}
+
+model User {
+  id          String   @id @default(cuid())
+  email       String
+  displayName String?
+  role        Role     @default(EMPLOYEE)
+  tenantId    String
+  createdAt   DateTime @default(now())
+
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  QueryLog  QueryLog[]
+
+  @@unique([tenantId, email])
+  @@index([tenantId])
+  @@index([role])
+}
+
+model Document {
+  id          String    @id @default(cuid())
+  tenantId    String?   // NULL => global (Workday Community)
+  title       String
+  sourceUri   String?
+  mimeType    String?
+  visibility  Role      @default(EMPLOYEE)
+  createdAt   DateTime  @default(now())
+
+  // Status tracking
+  status       DocStatus @default(UPLOADED)
+  errorMessage String?
+  processedAt  DateTime?
+  processingTimeMs Int?
+  chunksCount  Int?
+  textLength   Int?
+
+  Chunks      Chunk[]
+  tenant      Tenant?   @relation(fields: [tenantId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId])
+  @@index([visibility])
+  @@index([createdAt])
+}
+
+enum DocStatus {
+  UPLOADED
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+model Chunk {
+  id           String    @id @default(cuid())
+  tenantId     String?   // NULL => global
+  documentId   String
+  content      String
+  orderIndex   Int       @default(0)
+  visibility   Role      @default(EMPLOYEE)
+  createdAt    DateTime  @default(now())
+
+  // pgvector column — explicitly set to 3072 dimensions
+  embeddingVec Unsupported("vector(3072)")?
+  embeddingJson Json?
+
+  Document     Document  @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([documentId])
+  @@index([visibility])
+  @@index([createdAt])
+}
+
+model QueryLog {
+  id           String   @id @default(cuid())
+  question     String
+  answer       String
+  createdAt    DateTime @default(now())
+
+  // Metrics for debugging / analytics
+  resultsFound Int?     // nullable
+  searchTimeMs Int?
+  llmTimeMs    Int?
+  totalTimeMs  Int?
+
+  // Relations
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId String
+}
+
+model LoginToken {
+  id         String    @id @default(cuid())
+  email      String
+  tenantId   String
+  code       String
+  expiresAt  DateTime
+  consumedAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([email, tenantId])
+  @@index([expiresAt])
+}
