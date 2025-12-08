@@ -26,6 +26,8 @@ router.post("/start", async (req, res) => {
   try {
     const { email } = req.body || {};
     const tenantName = req.get("X-Tenant");
+    console.log("Tenant Name:", tenantName);
+    console.log(email)
 
     if (!email || !tenantName) {
       return res

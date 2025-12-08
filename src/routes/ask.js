@@ -715,14 +715,20 @@
 
 // export default router;
 
+
 // src/routes/ask.js
 import express from "express";
-import OpenAI from "openai";
 import { prisma } from "../prisma.js";
 import { embedText } from "../utils/embeddings.js";
 
 const router = express.Router();
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+// If you're on Node 18+ you have global fetch.
+// If not, uncomment this line and `npm i node-fetch`.
+// import fetch from "node-fetch";
+
+const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || "http://localhost:11434";
+const LLM_MODEL = process.env.LLM_MODEL || "llama3.2:3b";
 
 // --------------------
 // Safe JSON Parse (with auto-repair)
@@ -741,99 +747,140 @@ function safeJSONParse(raw, label = "unknown") {
         .trim();
       return JSON.parse(fixed);
     } catch (err2) {
-      console.error(`[safeJSONParse] Second attempt failed for ${label}:`, err2.message);
+      console.error(
+        `[safeJSONParse] Second attempt failed for ${label}:`,
+        err2.message
+      );
       return null;
     }
   }
 }
 
 // --------------------
-// Single LLM call - Answer generation
+// Single LLM call - Answer generation (Ollama)
 // --------------------
 async function answerWithLLM(question, expanded) {
   const context = expanded
     .map(
       (h, i) =>
-        `Source ${i + 1}${h.documentTitle ? ` [${h.documentTitle}]` : ""}:\n${h.content}`
+        `Source ${i + 1}${
+          h.documentTitle ? ` [${h.documentTitle}]` : ""
+        }:\n${h.content}`
     )
     .join("\n\n");
 
-  const answerPrompt = `
+  const SYSTEM_PROMPT = `
 You are a helpful Workday specialist having a conversation with an HRIS professional.
 Your goal is to provide clear, practical answers in a conversational but professional tone.
 
+CRITICAL GROUNDING RULES:
+- You MUST treat the provided "Context from Workday documentation" as the ONLY source of truth.
+- You MUST NOT use any Workday knowledge outside this context (no memory, no training data).
+- You MUST NOT invent:
+  - Workday task names
+  - Navigation paths (like "Edit Tenant Setup - Security > ...")
+  - Checkbox/field names
+  - Additional document titles or sections
+- You may only mention:
+  - Task names, fields, checkboxes, and navigation paths that appear VERBATIM in the context.
+- If the context doesn't show an exact path or task name, speak GENERICALLY (e.g., "from the authentication policy configuration") instead of fabricating a path.
+
+If something is not in the context, you must either:
+- Omit it, or
+- Explicitly say "the provided excerpt doesn't show the exact navigation path / task name".
+`;
+
+  const USER_PROMPT = `
 User question:
 """${question}"""
 
 Context from Workday documentation:
 ${context}
 
-Return STRICTLY valid JSON with this schema:
+Return STRICTLY valid JSON with this schema (no extra keys):
 
 {
-  "answer": "3-4 sentences that directly address their question in a conversational way. Use 'you' and 'your' to make it personal. Explain what this does and when they'd use it. Be specific about what happens in Workday.",
+  "answer": "3-4 sentences that directly address their question in a conversational way. Use 'you' and 'your' to make it personal. Explain what this does and when they'd use it. Be specific about what happens in Workday, but ONLY based on what appears in the context.",
   
   "main_steps": [
-    "4-6 key steps, each 1-2 sentences. Always include Workday task names in quotes like 'Change Job' or 'Edit Tenant Setup - HCM'. Focus on WHAT to do and WHERE to find it in Workday.",
-    "Be specific: instead of 'configure the setting', say 'Select the [exact checkbox name] checkbox'",
-    "Explain WHY each step matters when relevant"
+    "4-6 key steps, each 1-2 sentences. Only include Workday task names or navigation paths if they appear VERBATIM in the context text above.",
+    "If the context doesn't show an exact task or path, describe the step generically (for example: 'From the authentication policy configuration, select the Network Denylist field...') without naming a specific task that isn't in the context."
   ],
   
   "prerequisites": [
-    "List any required security permissions, business process configurations, or settings that must exist first. Be specific with domain names and task names. If none mentioned, return empty array."
+    "List any required security permissions, business process configurations, or settings that are explicitly mentioned in the context. Use the exact wording from the doc where possible. If none mentioned, return empty array."
   ],
   
   "important_notes": [
-    "3-7 critical limitations, restrictions, or behaviors they need to know. Focus on things that would surprise them or block their work.",
-    "Examples: 'Cannot reverse without canceling', 'Only works when X', 'Must configure Y first'",
-    "If none found, return empty array."
+    "3-7 critical limitations, restrictions, or behaviors that are explicitly in the context. Focus on things that would surprise them or block their work.",
+    "If none found in the context, return empty array."
   ],
   
   "related_topics": [
-    "2-5 related Workday features, tasks, or business processes mentioned in the context. Format as: 'Task Name - Brief description of how it relates'",
-    "These should be clickable topics the user might want to learn about next.",
+    "2-5 related Workday features, tasks, or business processes that are explicitly named in the context. Format as: 'Task/Feature Name - Brief description of how it relates'.",
     "If none found, return empty array."
   ],
   
-  "clarification_note": "If the question is ambiguous or could mean different things, provide a brief 1-2 sentence note explaining the ambiguity. Examples: 'This answer assumes you want to configure this feature. If you're looking to use it as an end-user, let me know.' or 'I'm covering the Change Job process here. There's also a Change Organization Assignments feature if that's what you meant.' If no ambiguity, return empty string.",
+  "clarification_note": "If the question is ambiguous or could mean different things, provide a brief 1-2 sentence note explaining the ambiguity. If no ambiguity based on the context, return empty string.",
   
-  "for_admins": true or false,
+  "for_admins": true,
   
   "confidence": {
     "level": "high|medium|low",
-    "reason": "1 sentence explaining confidence. High = context fully covers question. Medium = covers main points but missing details. Low = incomplete or only partially relevant."
-  },
-  
-  "sources": [
-    "List of document titles or URIs used, like 'Admin Guide - HCM (Staffing section)'"
-  ]
+    "reason": "1 sentence explaining confidence. High = context fully covers question. Medium = covers main points but missing details. Low = context is incomplete or only partially relevant."
+  }
 }
 
-Guidelines:
-- Write "answer" like you're explaining to a colleague, not writing documentation
-- Use natural language: "When you move a manager..." not "The Change Job business process enables..."
-- Be specific with task names, field names, checkbox names - put them in quotes
-- In "main_steps", assume they want to DO this, so guide them step-by-step
-- Only include information that's actually in the context - don't invent steps
-- If context is incomplete, say so naturally in "answer" and mark confidence low
-- For "clarification_note", only include if there's genuine ambiguity in what they're asking
+ADDITIONAL RULES:
+- Respond with ONLY a single JSON object.
+- Do NOT wrap the JSON in backticks.
+- Do NOT add any explanation before or after the JSON.
+- Every field must be present.
+- Arrays must be valid JSON arrays.
+- Do NOT mention any document titles or sources in this JSON. The caller will handle sources separately.
 `;
 
   try {
-    const resp = await openai.chat.completions.create({
-      model: "gpt-4o",
-      messages: [{ role: "system", content: answerPrompt }],
-      temperature: 0.3,
-      max_tokens: 1200,
-      response_format: { type: "json_object" },
+    const resp = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: LLM_MODEL,
+        stream: false,
+        format: "json", // force JSON output from Ollama
+        messages: [
+          { role: "system", content: SYSTEM_PROMPT },
+          { role: "user", content: USER_PROMPT },
+        ],
+        options: {
+          temperature: 0.2,
+          num_predict: 600,
+        },
+      }),
     });
 
-    const raw = resp.choices[0].message.content;
-    const parsed = safeJSONParse(raw, "answer");
+    if (!resp.ok) {
+      const text = await resp.text();
+      console.error("[Answer error] Ollama HTTP error:", resp.status, text);
+      throw new Error(`Ollama error: ${resp.status}`);
+    }
+
+    const data = await resp.json();
+
+    let raw = data?.message?.content;
+    let parsed;
+
+    if (typeof raw === "string") {
+      parsed = safeJSONParse(raw, "answer");
+    } else if (typeof raw === "object" && raw !== null) {
+      parsed = raw;
+    }
 
     if (!parsed) {
+      console.error("[Answer error] Could not parse JSON from LLM:", raw);
       return {
-        answer: "I found relevant information in the Workday docs, but had trouble formatting the response. Could you rephrase your question?",
+        answer:
+          "I found relevant information in the Workday docs, but had trouble formatting the response. Could you rephrase your question?",
         main_steps: [],
         prerequisites: [],
         important_notes: [],
@@ -841,18 +888,29 @@ Guidelines:
         clarification_note: "",
         for_admins: false,
         confidence: { level: "low", reason: "Response formatting error" },
-        sources: [],
       };
     }
 
     return {
-      ...parsed,
+      answer: parsed.answer || "",
+      main_steps: parsed.main_steps || [],
+      prerequisites: parsed.prerequisites || [],
+      important_notes: parsed.important_notes || [],
+      related_topics: parsed.related_topics || [],
       clarification_note: parsed.clarification_note || "",
+      for_admins:
+        typeof parsed.for_admins === "boolean" ? parsed.for_admins : true,
+      confidence:
+        parsed.confidence || {
+          level: "low",
+          reason: "No confidence provided",
+        },
     };
   } catch (err) {
     console.error("[Answer error]", err);
     return {
-      answer: "I encountered an error processing your question. Please try again or rephrase it.",
+      answer:
+        "I encountered an error processing your question. Please try again or rephrase it.",
       main_steps: [],
       prerequisites: [],
       important_notes: [],
@@ -860,7 +918,6 @@ Guidelines:
       clarification_note: "",
       for_admins: false,
       confidence: { level: "low", reason: "Generation error" },
-      sources: [],
     };
   }
 }
@@ -872,28 +929,44 @@ router.post("/", async (req, res) => {
   const start = Date.now();
   try {
     const { question } = req.body;
-    if (!question) return res.status(400).json({ ok: false, error: "question_required" });
+    if (!question) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "question_required" });
+    }
 
     console.log(`🧠 Question: "${question}"`);
     const qEmbed = await embedText(question);
 
-    // Retrieve top 5 chunks
+    // 1️⃣ Retrieve top 5 chunks with cosine distance score
+    // NOTE: score here is cosine *distance* (`<#>`), so LOWER = more similar.
     const hits = await prisma.$queryRaw`
-      SELECT c.id,
-             c.content,
-             c."documentId",
-             d.title        AS "documentTitle",
-             d."sourceUri",
-             c."orderIndex"
+      SELECT 
+        c.id,
+        c.content,
+        c."documentId",
+        d.title      AS "documentTitle",
+        d."sourceUri",
+        c."orderIndex",
+        (c."embeddingVec" <#> ${qEmbed.literal}::vector) AS "score"
       FROM "Chunk" c
       JOIN "Document" d ON c."documentId" = d.id
-      ORDER BY c."embeddingVec" <#> ${qEmbed.literal}::vector
+      ORDER BY "score" ASC
       LIMIT 5;
     `;
 
     console.log(`📚 Retrieved ${hits.length} chunks`);
 
-    // Expand only top 3 hits with smaller context window
+    // 2️⃣ Build doc metadata map
+    const docMetaById = new Map();
+    hits.forEach((h) => {
+      docMetaById.set(h.documentId, {
+        documentTitle: h.documentTitle,
+        sourceUri: h.sourceUri,
+      });
+    });
+
+    // 3️⃣ Expand around the top 3 hits (neighbors by orderIndex)
     const expanded = [];
     const seenChunkIds = new Set();
     const topHits = hits.slice(0, 3);
@@ -903,31 +976,93 @@ router.post("/", async (req, res) => {
         where: { documentId: h.documentId },
         orderBy: { orderIndex: "asc" },
         skip: Math.max(h.orderIndex - 1, 0),
-        take: 3, // Current + 1 before + 1 after
+        take: 3, // previous + current + next
+        select: {
+          id: true,
+          content: true,
+          documentId: true,
+          orderIndex: true,
+        },
       });
 
       neighbors.forEach((chunk) => {
         if (!seenChunkIds.has(chunk.id)) {
           seenChunkIds.add(chunk.id);
-          expanded.push(chunk);
+          const meta = docMetaById.get(chunk.documentId) || {};
+          expanded.push({
+            id: chunk.id,
+            content: chunk.content,
+            documentId: chunk.documentId,
+            orderIndex: chunk.orderIndex,
+            documentTitle: meta.documentTitle || null,
+            sourceUri: meta.sourceUri || null,
+          });
         }
       });
     }
 
     console.log(`📚 Expanded to ${expanded.length} chunks`);
 
-    // Generate answer
+    // 4️⃣ Generate answer from LLM with RAG context
     const answer = await answerWithLLM(question, expanded);
 
     const elapsed = Date.now() - start;
+
+    // 5️⃣ Shape hits for client (include score for explainability)
+    const hitsForClient = hits.map((h) => ({
+      id: h.id,
+      content: h.content,
+      documentId: h.documentId,
+      documentTitle: h.documentTitle,
+      sourceUri: h.sourceUri,
+      orderIndex: h.orderIndex,
+      score: Number(h.score), // cosine distance: lower = closer
+    }));
+
+    // 6️⃣ Build sources list from actual chunks (NO LLM hallucination)
+    const sourcesMap = new Map();
+    expanded.forEach((c) => {
+      const key = c.documentId;
+      if (!sourcesMap.has(key)) {
+        sourcesMap.set(key, {
+          documentId: c.documentId,
+          title: c.documentTitle,
+          sourceUri: c.sourceUri,
+        });
+      }
+    });
+    const sources = Array.from(sourcesMap.values());
+
+    // 7️⃣ Return everything (answer + retrieved chunks) for explainability & citations
     res.json({
       ok: true,
-      ...answer,
+
+      // LLM answer
+      answer: answer.answer,
+      main_steps: answer.main_steps,
+      prerequisites: answer.prerequisites,
+      important_notes: answer.important_notes,
+      related_topics: answer.related_topics,
+      clarification_note: answer.clarification_note,
+      for_admins: answer.for_admins,
+      confidence: answer.confidence,
+
+      // Retrieval info for frontend explainability
+      hits: hitsForClient, // top-k semantic matches with score
+      expanded,            // context chunks actually sent to LLM
+
+      // Sources derived from the actual chunks (no hallucination)
+      sources,
+
       time: `${elapsed}ms`,
     });
   } catch (err) {
     console.error("[ask error]", err);
-    res.status(500).json({ ok: false, error: "ask_failed", details: err.message });
+    res.status(500).json({
+      ok: false,
+      error: "ask_failed",
+      details: err.message,
+    });
   }
 });
 
