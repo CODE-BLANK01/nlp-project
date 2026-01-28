@@ -192,13 +192,16 @@
 // }
 
 // src/utils/embeddings.js
-const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || "http://localhost:11434";
-const EMBED_MODEL = process.env.EMBED_MODEL || "bge-large";
+import OpenAI from "openai";
+
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
 
 const delay = (ms) => new Promise((res) => setTimeout(res, ms));
 
 /**
- * Embed a single text using Ollama embeddings
+ * Embed a single text using OpenAI embeddings
  */
 export async function embedText(text) {
   if (!text || typeof text !== "string") {
@@ -206,41 +209,27 @@ export async function embedText(text) {
   }
 
   console.log(`🧠 Embedding single text (len=${text.length})...`);
+
   try {
-    const resp = await fetch(`${OLLAMA_BASE_URL}/api/embeddings`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: EMBED_MODEL,
-        prompt: text, // single string
-      }),
+    const response = await openai.embeddings.create({
+      model: "text-embedding-3-large",
+      input: text,
     });
 
-    if (!resp.ok) {
-      const body = await resp.text();
-      console.error("[embedText] Ollama HTTP error:", resp.status, body);
-      throw new Error(`Ollama embeddings error: ${resp.status}`);
-    }
-
-    const data = await resp.json();
-    const vector = data.embedding || data.embeddings?.[0];
-
-    if (!vector) {
-      throw new Error("No embedding returned from Ollama");
-    }
-
+    const vector = response.data[0].embedding;
     const literal = `[${vector.join(",")}]`;
+
     return { vector, literal };
   } catch (e) {
     console.error("[embedText] Embedding failed:", e.message);
-    // IMPORTANT: rethrow so the caller (ask.js) can handle it
+    // Rethrow so the caller can handle it
     throw e;
   }
 }
 
 /**
- * Embed many texts with retry/backoff.
- * NOTE: We embed ONE TEXT PER REQUEST because Ollama expects `prompt` to be a string.
+ * Embed many texts with batching + retry/backoff
+ * OpenAI allows batch embedding (multiple texts in one request)
  */
 export async function embedTextBatch(texts, batchSize = 50) {
   if (!Array.isArray(texts) || texts.length === 0) {
@@ -248,40 +237,55 @@ export async function embedTextBatch(texts, batchSize = 50) {
   }
 
   const startTime = Date.now();
+  const totalBatches = Math.ceil(texts.length / batchSize);
   const results = [];
 
-  console.log(`🧠 Embedding ${texts.length} chunks (1 request per chunk)...`);
+  console.log(`🧠 Embedding ${texts.length} chunks in ${totalBatches} batch(es)...`);
 
-  for (let i = 0; i < texts.length; i++) {
-    const text = texts[i];
-    const idx = i + 1;
+  for (let i = 0; i < texts.length; i += batchSize) {
+    const batch = texts.slice(i, i + batchSize);
+    const batchNo = Math.floor(i / batchSize) + 1;
+
+    console.log(`📦 Batch ${batchNo}/${totalBatches} → ${batch.length} items`);
 
     let attempt = 0;
-    // retry with backoff
+
     while (true) {
       try {
-        const { vector, literal } = await embedText(text);
-        results.push({ vector, literal });
+        const response = await openai.embeddings.create({
+          model: "text-embedding-3-large",
+          input: batch, // OpenAI accepts array of strings
+        });
+
+        response.data.forEach((item) => {
+          const vector = item.embedding;
+          const literal = `[${vector.join(",")}]`;
+          results.push({ vector, literal });
+        });
+
+        console.log(`✅ Batch ${batchNo} completed`);
         break;
       } catch (err) {
         attempt++;
-        const wait = Math.min(3000 * attempt, 15000);
-        console.warn(
-          `⏳ Error embedding chunk ${idx}/${texts.length}, attempt ${attempt}. Retrying in ${wait}ms...`,
-          err.message
-        );
-        await delay(wait);
-      }
-    }
 
-    if (idx % batchSize === 0 || idx === texts.length) {
-      console.log(`✅ Progress: ${idx}/${texts.length} chunks embedded`);
+        // Check for rate limit errors
+        if (err.code === "rate_limit_exceeded" || err.status === 429) {
+          const wait = Math.min(3000 * attempt, 15000); // exponential backoff with cap
+          console.warn(
+            `⏳ Rate limited on batch ${batchNo}, attempt ${attempt}. Retrying in ${wait}ms...`
+          );
+          await delay(wait);
+        } else {
+          console.error(`❌ Failed batch ${batchNo}:`, err.message);
+          throw err;
+        }
+      }
     }
   }
 
   const elapsed = Date.now() - startTime;
   console.log(
-    `🎉 Completed embeddings: ${results.length} chunks in ${elapsed}ms`
+    `🎉 Completed embeddings: ${results.length} chunks in ${totalBatches} batch(es), ${elapsed}ms total`
   );
 
   return results;

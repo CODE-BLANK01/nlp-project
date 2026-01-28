@@ -931,14 +931,393 @@
 // export default router;
 
 // src/routes/ask.js
+// import express from "express";
+// import { prisma } from "../prisma.js";
+// import { embedText } from "../utils/embeddings.js";
+
+// const router = express.Router();
+
+// const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || "http://localhost:11434";
+// const LLM_MODEL = process.env.LLM_MODEL || "llama3.2:3b";
+
+// // Tune this to be as strict as you want
+// // cosine_distance in [0, 2], with 0 = identical
+// // For cosine distance, similarity ≈ 1 - distance (when vectors are normalized)
+// const DISTANCE_MAX = 0.35; // smaller is better; ~0.35 ⇒ similarity ≈ 0.65
+
+// // --------------------
+// // Helpers
+// // --------------------
+// function safeJSONParse(raw, label = "unknown") {
+//   if (!raw) return null;
+//   try {
+//     return JSON.parse(raw);
+//   } catch (err) {
+//     console.warn(`[safeJSONParse] Initial parse failed for ${label}:`, err.message);
+//     try {
+//       const fixed = raw
+//         .replace(/,\s*]/g, "]")
+//         .replace(/,\s*}/g, "}")
+//         .replace(/\n/g, " ")
+//         .trim();
+//       return JSON.parse(fixed);
+//     } catch (err2) {
+//       console.error(`[safeJSONParse] Second parse failed for ${label}:`, err2.message);
+//       return null;
+//     }
+//   }
+// }
+
+// function sendSSE(res, event, data) {
+//   res.write(`event: ${event}\n`);
+//   res.write(`data: ${JSON.stringify(data)}\n\n`);
+// }
+
+// // --------------------
+// // LLM call (non-streaming from Ollama)
+// // --------------------
+// async function answerWithLLM(question, expandedChunks) {
+//   const context = expandedChunks
+//     .map(
+//       (c, i) =>
+//         `Source ${i + 1}${
+//           c.documentTitle ? ` [${c.documentTitle}]` : ""
+//         } (orderIndex=${c.orderIndex ?? "?"}):\n${c.content}`
+//     )
+//     .join("\n\n");
+
+//   const SYSTEM_PROMPT = `
+// You are a helpful Workday specialist answering questions for HRIS and Admin users.
+
+// CRITICAL GROUNDING RULES:
+// - You MUST treat the provided "Context from Workday documentation" as the ONLY source of truth.
+// - You MUST NOT use any Workday knowledge outside this context.
+// - You MUST NOT invent:
+//   - Workday task names
+//   - Navigation paths
+//   - Checkbox / field names
+//   - Document titles
+// - Only mention task names, fields, or navigation paths that appear VERBATIM in the context.
+// - If the context doesn't show an exact path or task name, speak GENERICALLY (e.g., "from the authentication policy configuration") instead of fabricating a path.
+// `;
+
+//   const USER_PROMPT = `
+// User question:
+// """${question}"""
+
+// Context from Workday documentation:
+// ${context}
+
+// Respond in plain text (no JSON, no markdown). Requirements:
+// - 3–6 sentences.
+// - Directly answer their question in a conversational but professional tone.
+// - ONLY say things that are clearly supported by the context.
+// - If the context does NOT contain enough information to answer, say:
+//   "I’m only allowed to answer using the provided Workday documentation, and nothing in the retrieved excerpts directly answers this question without guessing."
+// - Do NOT suggest anything that isn't grounded in the context.
+// `;
+
+//   try {
+//     const resp = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
+//       method: "POST",
+//       headers: { "Content-Type": "application/json" },
+//       body: JSON.stringify({
+//         model: LLM_MODEL,
+//         stream: false,
+//         messages: [
+//           { role: "system", content: SYSTEM_PROMPT },
+//           { role: "user", content: USER_PROMPT },
+//         ],
+//         options: {
+//           temperature: 0.1,
+//           num_predict: 512,
+//         },
+//       }),
+//     });
+
+//     if (!resp.ok) {
+//       const text = await resp.text();
+//       console.error("[answerWithLLM] Ollama HTTP error:", resp.status, text);
+//       throw new Error(`Ollama error: ${resp.status}`);
+//     }
+
+//     const data = await resp.json();
+//     const rawContent = data?.message?.content;
+
+//     if (!rawContent || typeof rawContent !== "string") {
+//       console.error("[answerWithLLM] Unexpected LLM response:", data);
+//       return (
+//         "I tried to generate an answer from the uploaded Workday documentation, " +
+//         "but something went wrong formatting the response. Please try rephrasing your question."
+//       );
+//     }
+
+//     return rawContent.trim();
+//   } catch (err) {
+//     console.error("[answerWithLLM] Error:", err);
+//     return (
+//       "I encountered an error while processing your question. " +
+//       "I’m only allowed to answer based on the uploaded Workday documentation, " +
+//       "so I can’t safely answer this right now."
+//     );
+//   }
+// }
+
+// // --------------------
+// // Main Ask route (SSE streaming)
+// // --------------------
+// router.post("/", async (req, res) => {
+//   const start = Date.now();
+
+//   // Setup SSE headers
+//   res.setHeader("Content-Type", "text/event-stream");
+//   res.setHeader("Cache-Control", "no-cache");
+//   res.setHeader("Connection", "keep-alive");
+//   // In case of proxies
+//   res.flushHeaders && res.flushHeaders();
+
+//   try {
+//     const { question } = req.body || {};
+
+//     if (!question || typeof question !== "string" || !question.trim()) {
+//       sendSSE(res, "error", {
+//         ok: false,
+//         error: "question_required",
+//       });
+//       return res.end();
+//     }
+
+//     const trimmedQuestion = question.trim();
+//     console.log(`🧠 Question: "${trimmedQuestion}"`);
+
+//     // 1) Embed question
+//     const qEmbed = await embedText(trimmedQuestion);
+
+//     // 2) Retrieve top chunks with distance
+// const rawHits = await prisma.$queryRaw`
+//   SELECT
+//     c.id,
+//     c.content,
+//     c."documentId",
+//     d.title      AS "documentTitle",
+//     d."sourceUri",
+//     c."orderIndex",
+//     (c."embeddingVec" <=> ${qEmbed.literal}::vector) AS "distance" -- COSINE distance
+//   FROM "Chunk" c
+//   JOIN "Document" d ON c."documentId" = d.id
+//   ORDER BY "distance" ASC
+//   LIMIT 8;
+// `;
+
+//     if (!rawHits || rawHits.length === 0) {
+//       console.log("📚 No chunks found at all");
+//       sendSSE(res, "chunks", {
+//         ok: true,
+//         hits: [],
+//         expanded: [],
+//         sources: [],
+//         time: `${Date.now() - start}ms`,
+//       });
+//       // No docs ⇒ no answer
+//       sendSSE(res, "answer", {
+//         ok: true,
+//         answer:
+//           "I’m only allowed to answer using the Workday documentation that’s been uploaded, " +
+//           "and I couldn’t retrieve anything relevant for this question.",
+//         done: true,
+//         confidence: {
+//           level: "low",
+//           reason: "No chunks were retrieved from the vector store.",
+//         },
+//       });
+//       return res.end();
+//     }
+
+//     // Normalize scores: compute similarity too
+// const hitsWithScores = rawHits.map((h) => {
+//   const distance = Number(h.distance); // cosine distance in [0, 2]
+//   let similarity = 1 - distance;       // similarity ~ [ -1, 1 ]
+
+//   // Clamp to [0, 1] for sanity
+//   if (similarity < 0) similarity = 0;
+//   if (similarity > 1) similarity = 1;
+
+//   return {
+//     id: h.id,
+//     content: h.content,
+//     documentId: h.documentId,
+//     documentTitle: h.documentTitle,
+//     sourceUri: h.sourceUri,
+//     orderIndex: h.orderIndex,
+//     distance,
+//     similarity,
+//   };
+// });
+
+//     const best = hitsWithScores[0];
+//     const bestDistance = best.distance;
+//     const bestSimilarity = best.similarity;
+
+//     console.log(
+//       `📚 Retrieved ${hitsWithScores.length} chunks. Best distance=${bestDistance.toFixed(
+//         4
+//       )}, similarity≈${bestSimilarity.toFixed(4)}`
+//     );
+
+//     // 3) Build doc metadata + expanded context
+//     const docMetaById = new Map();
+//     hitsWithScores.forEach((h) => {
+//       docMetaById.set(h.documentId, {
+//         documentTitle: h.documentTitle,
+//         sourceUri: h.sourceUri,
+//       });
+//     });
+
+//     const expanded = [];
+//     const seenChunkIds = new Set();
+
+//     // expand around top 3 hits
+//     const topForExpansion = hitsWithScores.slice(0, 3);
+//     for (const h of topForExpansion) {
+//       const neighbors = await prisma.chunk.findMany({
+//         where: { documentId: h.documentId },
+//         orderBy: { orderIndex: "asc" },
+//         skip: Math.max(h.orderIndex - 1, 0),
+//         take: 3, // previous + current + next
+//         select: {
+//           id: true,
+//           content: true,
+//           documentId: true,
+//           orderIndex: true,
+//         },
+//       });
+
+//       neighbors.forEach((chunk) => {
+//         if (!seenChunkIds.has(chunk.id)) {
+//           seenChunkIds.add(chunk.id);
+//           const meta = docMetaById.get(chunk.documentId) || {};
+//           expanded.push({
+//             id: chunk.id,
+//             content: chunk.content,
+//             documentId: chunk.documentId,
+//             orderIndex: chunk.orderIndex,
+//             documentTitle: meta.documentTitle || null,
+//             sourceUri: meta.sourceUri || null,
+//           });
+//         }
+//       });
+//     }
+
+//     // Sources: unique per document
+//     const sourcesMap = new Map();
+//     expanded.forEach((c) => {
+//       if (!sourcesMap.has(c.documentId)) {
+//         sourcesMap.set(c.documentId, {
+//           documentId: c.documentId,
+//           title: c.documentTitle,
+//           sourceUri: c.sourceUri,
+//         });
+//       }
+//     });
+//     const sources = Array.from(sourcesMap.values());
+
+//     // 4) Send chunks immediately to client so TAs can see them
+//     sendSSE(res, "chunks", {
+//       ok: true,
+//       hits: hitsWithScores,
+//       expanded,
+//       sources,
+//       time: `${Date.now() - start}ms`,
+//     });
+
+//     // 5) Retrieval gating: DO NOT CALL LLM if similarity is too low
+//     if (bestDistance > DISTANCE_MAX) {
+//       console.log(
+//         `❌ Retrieval below threshold. Best distance=${bestDistance.toFixed(
+//           4
+//         )} > ${DISTANCE_MAX}`
+//       );
+
+//       const msg =
+//         "I’m only allowed to answer questions using the Workday documentation your organization uploaded. " +
+//         "For this question, none of the retrieved passages were similar enough, so I can’t answer it without guessing.";
+
+//       sendSSE(res, "answer", {
+//         ok: true,
+//         answer: msg,
+//         done: true,
+//         confidence: {
+//           level: "low",
+//           reason: `Top chunk distance ${bestDistance.toFixed(
+//             3
+//           )} exceeded threshold ${DISTANCE_MAX}. Answering would require hallucinating.`,
+//         },
+//       });
+
+//       return res.end();
+//     }
+
+//     // 6) We have good enough retrieval ⇒ call LLM (still fully grounded)
+//     const fullAnswer = await answerWithLLM(trimmedQuestion, expanded);
+
+//     // 7) Stream the answer text in small chunks
+//     const words = fullAnswer.split(/\s+/);
+//     let buffer = "";
+
+//     for (let i = 0; i < words.length; i++) {
+//       buffer += (buffer ? " " : "") + words[i];
+
+//       // send every ~12 words or on last word
+//       if (buffer.length > 0 && (i % 12 === 0 || i === words.length - 1)) {
+//         sendSSE(res, "answer_delta", {
+//           chunk: buffer,
+//         });
+//         buffer = "";
+//       }
+//     }
+
+//     // 8) Final "done" event with light metadata
+//     sendSSE(res, "answer", {
+//       ok: true,
+//       done: true,
+//       confidence: {
+//         level: "high",
+//         reason:
+//           "Top retrieved chunks were above the similarity threshold and the answer was generated strictly from those excerpts.",
+//       },
+//     });
+
+//     return res.end();
+//   } catch (err) {
+//     console.error("[ask] Fatal error:", err);
+//     try {
+//       sendSSE(res, "error", {
+//         ok: false,
+//         error: "ask_failed",
+//         details: err.message,
+//       });
+//     } catch (_) {
+//       // ignore secondary error
+//     }
+//     return res.end();
+//   }
+// });
+
+// export default router;
+
 import express from "express";
+import OpenAI from "openai";
 import { prisma } from "../prisma.js";
 import { embedText } from "../utils/embeddings.js";
 
 const router = express.Router();
 
-const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || "http://localhost:11434";
-const LLM_MODEL = process.env.LLM_MODEL || "llama3.2:3b";
+// Initialize OpenAI client
+const openai = new OpenAI({ 
+  apiKey: process.env.OPENAI_API_KEY 
+});
+
+const LLM_MODEL = process.env.LLM_MODEL || "gpt-4o-mini";
 
 // Tune this to be as strict as you want
 // cosine_distance in [0, 2], with 0 = identical
@@ -974,7 +1353,7 @@ function sendSSE(res, event, data) {
 }
 
 // --------------------
-// LLM call (non-streaming from Ollama)
+// LLM call using OpenAI
 // --------------------
 async function answerWithLLM(question, expandedChunks) {
   const context = expandedChunks
@@ -1013,39 +1392,25 @@ Respond in plain text (no JSON, no markdown). Requirements:
 - Directly answer their question in a conversational but professional tone.
 - ONLY say things that are clearly supported by the context.
 - If the context does NOT contain enough information to answer, say:
-  "I’m only allowed to answer using the provided Workday documentation, and nothing in the retrieved excerpts directly answers this question without guessing."
+  "I'm only allowed to answer using the provided Workday documentation, and nothing in the retrieved excerpts directly answers this question without guessing."
 - Do NOT suggest anything that isn't grounded in the context.
 `;
 
   try {
-    const resp = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: LLM_MODEL,
-        stream: false,
-        messages: [
-          { role: "system", content: SYSTEM_PROMPT },
-          { role: "user", content: USER_PROMPT },
-        ],
-        options: {
-          temperature: 0.1,
-          num_predict: 512,
-        },
-      }),
+    const resp = await openai.chat.completions.create({
+      model: LLM_MODEL,
+      messages: [
+        { role: "system", content: SYSTEM_PROMPT },
+        { role: "user", content: USER_PROMPT },
+      ],
+      temperature: 0.1,
+      max_tokens: 512,
     });
 
-    if (!resp.ok) {
-      const text = await resp.text();
-      console.error("[answerWithLLM] Ollama HTTP error:", resp.status, text);
-      throw new Error(`Ollama error: ${resp.status}`);
-    }
-
-    const data = await resp.json();
-    const rawContent = data?.message?.content;
+    const rawContent = resp.choices[0]?.message?.content;
 
     if (!rawContent || typeof rawContent !== "string") {
-      console.error("[answerWithLLM] Unexpected LLM response:", data);
+      console.error("[answerWithLLM] Unexpected LLM response:", resp);
       return (
         "I tried to generate an answer from the uploaded Workday documentation, " +
         "but something went wrong formatting the response. Please try rephrasing your question."
@@ -1057,8 +1422,8 @@ Respond in plain text (no JSON, no markdown). Requirements:
     console.error("[answerWithLLM] Error:", err);
     return (
       "I encountered an error while processing your question. " +
-      "I’m only allowed to answer based on the uploaded Workday documentation, " +
-      "so I can’t safely answer this right now."
+      "I'm only allowed to answer based on the uploaded Workday documentation, " +
+      "so I can't safely answer this right now."
     );
   }
 }
@@ -1122,8 +1487,8 @@ const rawHits = await prisma.$queryRaw`
       sendSSE(res, "answer", {
         ok: true,
         answer:
-          "I’m only allowed to answer using the Workday documentation that’s been uploaded, " +
-          "and I couldn’t retrieve anything relevant for this question.",
+          "I'm only allowed to answer using the Workday documentation that's been uploaded, " +
+          "and I couldn't retrieve anything relevant for this question.",
         done: true,
         confidence: {
           level: "low",
@@ -1239,8 +1604,8 @@ const hitsWithScores = rawHits.map((h) => {
       );
 
       const msg =
-        "I’m only allowed to answer questions using the Workday documentation your organization uploaded. " +
-        "For this question, none of the retrieved passages were similar enough, so I can’t answer it without guessing.";
+        "I'm only allowed to answer questions using the Workday documentation your organization uploaded. " +
+        "For this question, none of the retrieved passages were similar enough, so I can't answer it without guessing.";
 
       sendSSE(res, "answer", {
         ok: true,
